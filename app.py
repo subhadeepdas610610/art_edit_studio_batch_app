@@ -130,113 +130,70 @@ def load_local_input_cached(input_dir_str: str, pdf_dpi: int) -> list[tuple[str,
     return collected
 
 
-# 2. Backend Dynamic Analysis (supports both increasing and decreasing knobs)
+# 2. Backend Dynamic Analysis (balanced to avoid both oversaturation and faint output)
 # ---------------------------------------------------------------------------
 def analyze_image(pil_img: Image.Image) -> dict[str, float | bool]:
-    """Inspect tone, saturation, brightness, contrast, and detail to recommend balanced settings."""
+    """Recommend balanced settings that avoid both harsh oversaturation and faint/washed-out tones."""
     rgb = np.array(pil_img.convert("RGB")).astype(np.float32)
     hsv = cv2.cvtColor(rgb.astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
     gray = cv2.cvtColor(rgb.astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32)
 
     mean_sat = float(np.mean(hsv[:, :, 1]))
-    high_sat_ratio = float(np.mean(hsv[:, :, 1] > 110.0))
+    high_sat_ratio = float(np.mean(hsv[:, :, 1] > 135.0))
     mean_val = float(np.mean(hsv[:, :, 2]))
-    highlight_ratio = float(np.mean(gray > 225.0))
-    dark_ratio = float(np.mean(gray < 55.0))
+    highlight_ratio = float(np.mean(gray > 232.0))
+    dark_ratio = float(np.mean(gray < 50.0))
     contrast_std = float(np.std(gray))
     edge_sharpness = float(cv2.Laplacian(gray, cv2.CV_32F).var())
     texture_var = float(np.var(gray))
 
-    is_sketch = mean_sat < 28.0 and high_sat_ratio < 0.05
+    is_sketch = mean_sat < 26.0 and high_sat_ratio < 0.04
 
     if is_sketch:
         rec_sat = 1.00
         rec_vibrance = 1.00
-        if contrast_std > 78.0:
-            rec_contrast = 0.94
-        elif contrast_std < 55.0:
-            rec_contrast = 1.12
-        else:
-            rec_contrast = 1.04
-
-        if edge_sharpness > 950.0:
-            rec_sharpness = 0.92
-            rec_clarity = 0.95
-        elif edge_sharpness < 450.0:
-            rec_sharpness = 1.16
-            rec_clarity = 1.12
-        else:
-            rec_sharpness = 1.05
-            rec_clarity = 1.05
-
-        if mean_val > 195.0 or highlight_ratio > 0.16:
-            rec_gamma = 1.03
-            rec_brightness = 0.97
-        elif mean_val < 165.0:
-            rec_gamma = 0.98
-            rec_brightness = 1.06
-        else:
-            rec_gamma = 1.00
-            rec_brightness = 1.01
-
-        rec_warmth = 0.02 if mean_val < 185.0 else -0.02
-        rec_shadow_lift = 0.14 if dark_ratio > 0.12 else 0.04
+        rec_contrast = 0.96 if contrast_std > 85.0 else (1.12 if contrast_std < 50.0 else 1.05)
+        rec_sharpness = 0.95 if edge_sharpness > 1100.0 else (1.16 if edge_sharpness < 420.0 else 1.06)
+        rec_clarity = 0.97 if edge_sharpness > 1100.0 else (1.12 if edge_sharpness < 420.0 else 1.04)
+        rec_gamma = 1.02 if (mean_val > 205.0 and highlight_ratio > 0.20) else (0.98 if mean_val < 160.0 else 1.00)
+        rec_brightness = 0.98 if (mean_val > 205.0 and highlight_ratio > 0.20) else (1.05 if mean_val < 165.0 else 1.01)
+        rec_warmth = 0.02 if mean_val < 185.0 else 0.0
+        rec_shadow_lift = 0.14 if dark_ratio > 0.12 else 0.05
         rec_bg_pop = 1.02
         rec_grain = False
     else:
-        # Tone down saturation/vibrance when the scan/image is already vivid or saturated
-        if mean_sat > 125.0 or high_sat_ratio > 0.35:
-            rec_sat = 0.88
-            rec_vibrance = 0.90
-            rec_bg_pop = 0.92
-        elif mean_sat > 105.0:
-            rec_sat = 0.95
+        if mean_sat > 145.0 and high_sat_ratio > 0.45:
+            rec_sat = 0.94
             rec_vibrance = 0.96
-            rec_bg_pop = 0.97
-        elif mean_sat < 65.0:
-            rec_sat = 1.16
-            rec_vibrance = 1.18
-            rec_bg_pop = 1.12
+            rec_bg_pop = 0.96
+        elif mean_sat < 85.0:
+            rec_sat = 1.14
+            rec_vibrance = 1.16
+            rec_bg_pop = 1.10
         else:
-            rec_sat = 1.03
-            rec_vibrance = 1.05
-            rec_bg_pop = 1.05
+            rec_sat = 1.04
+            rec_vibrance = 1.06
+            rec_bg_pop = 1.04
 
-        # Tone down contrast if already high-contrast; lift gently only if flat
-        if contrast_std > 75.0:
-            rec_contrast = 0.92
-        elif contrast_std < 48.0:
-            rec_contrast = 1.10
+        rec_contrast = 0.96 if contrast_std > 85.0 else (1.10 if contrast_std < 50.0 else 1.04)
+        rec_sharpness = 0.95 if edge_sharpness > 1100.0 else (1.12 if edge_sharpness < 350.0 else 1.04)
+        rec_clarity = 0.97 if edge_sharpness > 1100.0 else (1.08 if edge_sharpness < 350.0 else 1.04)
+
+        if mean_val > 200.0 and highlight_ratio > 0.18:
+            rec_gamma = 1.02
+            rec_brightness = 0.97
+            rec_shadow_lift = 0.06
+        elif mean_val < 150.0:
+            rec_gamma = 0.97
+            rec_brightness = 1.04
+            rec_shadow_lift = 0.14 if dark_ratio > 0.08 else 0.07
         else:
-            rec_contrast = 1.02
+            rec_gamma = 0.99
+            rec_brightness = 1.01
+            rec_shadow_lift = 0.08
 
-        # Avoid over-sharpening already crisp scans/digital renders
-        if edge_sharpness > 900.0:
-            rec_sharpness = 0.92
-            rec_clarity = 0.95
-        elif edge_sharpness < 350.0:
-            rec_sharpness = 1.12
-            rec_clarity = 1.08
-        else:
-            rec_sharpness = 1.03
-            rec_clarity = 1.03
-
-        # Protect bright/high-value images from looking blown out or overly bright
-        if mean_val > 180.0 or highlight_ratio > 0.14:
-            rec_gamma = 1.04
-            rec_brightness = 0.95
-            rec_shadow_lift = 0.04
-        elif mean_val < 145.0:
-            rec_gamma = 0.96
-            rec_brightness = 1.05
-            rec_shadow_lift = 0.16 if dark_ratio > 0.08 else 0.08
-        else:
-            rec_gamma = 1.00
-            rec_brightness = 0.99
-            rec_shadow_lift = 0.08 if dark_ratio > 0.10 else 0.05
-
-        rec_warmth = 0.02 if mean_val < 175.0 else -0.02
-        rec_grain = texture_var < 950.0 and mean_val < 190.0
+        rec_warmth = 0.02 if mean_val < 185.0 else 0.0
+        rec_grain = texture_var < 950.0 and mean_val < 185.0
 
     return {
         "sat": round(rec_sat, 2),
@@ -285,62 +242,55 @@ MEDIUM_PROFILES = [
 
 
 def enhance_pastel_backend(pil_img: Image.Image, base_rec: dict[str, float | bool]) -> dict[str, float | bool]:
-    """Refine dynamic recommendations for pastel artwork without over-saturating or over-brightening."""
+    """Keep pastel artwork vibrant and readable without making it faint or chalky."""
     rgb = np.array(pil_img.convert("RGB")).astype(np.float32)
     hsv = cv2.cvtColor(rgb.astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
     gray = cv2.cvtColor(rgb.astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32)
 
     mean_sat = float(np.mean(hsv[:, :, 1]))
-    high_sat_ratio = float(np.mean(hsv[:, :, 1] > 110.0))
+    high_sat_ratio = float(np.mean(hsv[:, :, 1] > 135.0))
     mean_val = float(np.mean(hsv[:, :, 2]))
-    highlight_ratio = float(np.mean(gray > 220.0))
+    highlight_ratio = float(np.mean(gray > 232.0))
     contrast_std = float(np.std(gray))
 
     rec = dict(base_rec)
 
-    if mean_sat > 120.0 or high_sat_ratio > 0.32:
-        rec["sat"] = round(min(float(rec["sat"]), 0.88), 2)
-        rec["vibrance"] = round(min(float(rec["vibrance"]), 0.90), 2)
-        rec["bg_pop"] = round(min(float(rec["bg_pop"]), 0.92), 2)
-    elif mean_sat < 68.0:
-        rec["sat"] = round(min(1.20, float(rec["sat"]) + 0.03), 2)
-        rec["vibrance"] = round(min(1.22, float(rec["vibrance"]) + 0.03), 2)
-        rec["bg_pop"] = round(min(1.15, float(rec["bg_pop"]) + 0.02), 2)
+    if mean_sat > 145.0 and high_sat_ratio > 0.45:
+        rec["sat"] = round(min(float(rec["sat"]), 0.95), 2)
+        rec["vibrance"] = round(min(float(rec["vibrance"]), 0.97), 2)
+        rec["bg_pop"] = round(min(float(rec["bg_pop"]), 0.96), 2)
     else:
-        rec["sat"] = round(min(float(rec["sat"]), 0.96), 2)
-        rec["vibrance"] = round(min(float(rec["vibrance"]), 0.98), 2)
+        rec["sat"] = round(max(1.04, min(1.20, float(rec["sat"]) + 0.02)), 2)
+        rec["vibrance"] = round(max(1.06, min(1.22, float(rec["vibrance"]) + 0.02)), 2)
+        rec["bg_pop"] = round(max(1.04, min(1.14, float(rec["bg_pop"]) + 0.02)), 2)
 
-    if contrast_std > 72.0:
-        rec["contrast"] = round(min(float(rec["contrast"]), 0.93), 2)
-        rec["clarity"] = round(min(float(rec["clarity"]), 0.96), 2)
-    else:
-        rec["contrast"] = round(min(1.08, max(0.92, float(rec["contrast"]))), 2)
-        rec["clarity"] = round(min(1.08, max(0.95, float(rec["clarity"]))), 2)
+    rec["contrast"] = round(0.96 if contrast_std > 85.0 else max(1.04, min(1.12, float(rec["contrast"]))), 2)
+    rec["clarity"] = round(0.98 if contrast_std > 85.0 else max(1.04, min(1.12, float(rec["clarity"]))), 2)
 
-    if mean_val > 178.0 or highlight_ratio > 0.12:
-        rec["brightness"] = round(min(float(rec["brightness"]), 0.94), 2)
-        rec["gamma"] = round(max(float(rec["gamma"]), 1.04), 2)
-    elif mean_val < 145.0:
+    if mean_val > 200.0 and highlight_ratio > 0.18:
+        rec["brightness"] = round(min(float(rec["brightness"]), 0.97), 2)
+        rec["gamma"] = round(max(float(rec["gamma"]), 1.02), 2)
+    elif mean_val < 155.0:
         rec["brightness"] = round(min(1.08, float(rec["brightness"]) + 0.02), 2)
 
     return rec
 
 
 def resolve_medium_and_base(pil_img: Image.Image, chosen_medium: str) -> tuple[str, dict[str, float | bool]]:
-    """Return effective medium name and tailored baseline knobs (capable of both boost and reduction)."""
+    """Return effective medium name and tailored baseline knobs."""
     base = analyze_image(pil_img)
     rgb = np.array(pil_img.convert("RGB")).astype(np.float32)
     hsv = cv2.cvtColor(rgb.astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
     gray = cv2.cvtColor(rgb.astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32)
 
     mean_sat = float(np.mean(hsv[:, :, 1]))
-    high_sat_ratio = float(np.mean(hsv[:, :, 1] > 110.0))
+    high_sat_ratio = float(np.mean(hsv[:, :, 1] > 135.0))
     mean_val = float(np.mean(hsv[:, :, 2]))
     contrast_std = float(np.std(gray))
     edge_sharpness = float(cv2.Laplacian(gray, cv2.CV_32F).var())
 
     if chosen_medium == "Auto-Detect":
-        effective_medium = "Pencil" if (mean_sat < 28.0 and high_sat_ratio < 0.05) else "Pastel"
+        effective_medium = "Pencil" if (mean_sat < 26.0 and high_sat_ratio < 0.04) else "Pastel"
     else:
         effective_medium = chosen_medium
 
@@ -352,40 +302,40 @@ def resolve_medium_and_base(pil_img: Image.Image, chosen_medium: str) -> tuple[s
         rec["sat"] = 1.00
         rec["vibrance"] = 1.00
         rec["bg_pop"] = 1.00
-        rec["warmth"] = 0.01 if mean_val < 180.0 else -0.02
-        rec["contrast"] = round(0.93 if contrast_std > 75.0 else (1.16 if contrast_std < 52.0 else 1.05), 2)
-        rec["sharpness"] = round(0.92 if edge_sharpness > 900.0 else (1.20 if edge_sharpness < 450.0 else 1.06), 2)
-        rec["clarity"] = round(0.95 if edge_sharpness > 900.0 else (1.14 if edge_sharpness < 450.0 else 1.04), 2)
-        rec["gamma"] = round(1.04 if mean_val > 190.0 else (0.97 if mean_val < 160.0 else 1.00), 2)
-        rec["brightness"] = round(0.95 if mean_val > 190.0 else (1.06 if mean_val < 165.0 else 1.00), 2)
-        rec["shadow_lift"] = round(0.16 if (contrast_std < 50.0 and mean_val < 180.0) else 0.04, 2)
+        rec["warmth"] = 0.02 if mean_val < 185.0 else 0.0
+        rec["contrast"] = round(0.96 if contrast_std > 85.0 else (1.18 if contrast_std < 52.0 else 1.08), 2)
+        rec["sharpness"] = round(0.96 if edge_sharpness > 1100.0 else (1.22 if edge_sharpness < 450.0 else 1.10), 2)
+        rec["clarity"] = round(0.98 if edge_sharpness > 1100.0 else (1.16 if edge_sharpness < 450.0 else 1.08), 2)
+        rec["gamma"] = round(1.02 if mean_val > 205.0 else (0.97 if mean_val < 160.0 else 1.00), 2)
+        rec["brightness"] = round(0.98 if mean_val > 205.0 else (1.06 if mean_val < 165.0 else 1.01), 2)
+        rec["shadow_lift"] = round(0.16 if contrast_std < 52.0 else 0.06, 2)
         rec["grain"] = False
         return effective_medium, rec
 
     if effective_medium == "Digital (Krita)":
         rec = dict(base)
-        rec["sat"] = round(0.90 if mean_sat > 120.0 else min(1.04, float(base["sat"])), 2)
-        rec["vibrance"] = round(0.92 if mean_sat > 120.0 else min(1.04, float(base["vibrance"])), 2)
-        rec["contrast"] = round(0.94 if contrast_std > 75.0 else (1.04 if contrast_std < 50.0 else 1.00), 2)
-        rec["sharpness"] = round(0.94 if edge_sharpness > 900.0 else (1.04 if edge_sharpness < 350.0 else 1.00), 2)
-        rec["clarity"] = round(0.96 if edge_sharpness > 900.0 else 1.02, 2)
-        rec["gamma"] = round(1.03 if mean_val > 185.0 else 1.00, 2)
-        rec["brightness"] = round(0.96 if mean_val > 185.0 else 1.00, 2)
+        rec["sat"] = round(0.96 if (mean_sat > 145.0 and high_sat_ratio > 0.45) else min(1.06, float(base["sat"])), 2)
+        rec["vibrance"] = round(0.98 if (mean_sat > 145.0 and high_sat_ratio > 0.45) else min(1.06, float(base["vibrance"])), 2)
+        rec["contrast"] = round(0.97 if contrast_std > 85.0 else (1.05 if contrast_std < 50.0 else 1.01), 2)
+        rec["sharpness"] = round(0.97 if edge_sharpness > 1100.0 else (1.05 if edge_sharpness < 350.0 else 1.01), 2)
+        rec["clarity"] = round(0.98 if edge_sharpness > 1100.0 else 1.03, 2)
+        rec["gamma"] = round(1.02 if mean_val > 200.0 else 1.00, 2)
+        rec["brightness"] = round(0.98 if mean_val > 200.0 else 1.00, 2)
         rec["shadow_lift"] = 0.03
-        rec["bg_pop"] = round(0.95 if mean_sat > 120.0 else 1.02, 2)
+        rec["bg_pop"] = round(0.98 if (mean_sat > 145.0 and high_sat_ratio > 0.45) else 1.03, 2)
         return effective_medium, rec
 
     # Sketch Pen / Marker
     rec = dict(base)
-    rec["sat"] = round(0.90 if mean_sat > 120.0 else (1.08 if mean_sat < 75.0 else 1.00), 2)
-    rec["vibrance"] = round(0.92 if mean_sat > 120.0 else (1.08 if mean_sat < 75.0 else 1.00), 2)
-    rec["contrast"] = round(0.93 if contrast_std > 75.0 else (1.14 if contrast_std < 55.0 else 1.04), 2)
-    rec["sharpness"] = round(0.93 if edge_sharpness > 900.0 else (1.16 if edge_sharpness < 500.0 else 1.05), 2)
-    rec["clarity"] = round(0.96 if edge_sharpness > 900.0 else 1.08, 2)
-    rec["gamma"] = round(1.03 if mean_val > 185.0 else 0.98, 2)
-    rec["brightness"] = round(0.96 if mean_val > 185.0 else (1.04 if mean_val < 160.0 else 1.00), 2)
-    rec["shadow_lift"] = 0.06
-    rec["bg_pop"] = round(0.94 if mean_sat > 120.0 else 1.04, 2)
+    rec["sat"] = round(0.96 if (mean_sat > 145.0 and high_sat_ratio > 0.45) else (1.10 if mean_sat < 80.0 else 1.02), 2)
+    rec["vibrance"] = round(0.98 if (mean_sat > 145.0 and high_sat_ratio > 0.45) else (1.10 if mean_sat < 80.0 else 1.02), 2)
+    rec["contrast"] = round(0.96 if contrast_std > 85.0 else (1.15 if contrast_std < 55.0 else 1.06), 2)
+    rec["sharpness"] = round(0.96 if edge_sharpness > 1100.0 else (1.18 if edge_sharpness < 500.0 else 1.08), 2)
+    rec["clarity"] = round(0.98 if edge_sharpness > 1100.0 else 1.10, 2)
+    rec["gamma"] = round(1.02 if mean_val > 200.0 else 0.98, 2)
+    rec["brightness"] = round(0.98 if mean_val > 200.0 else (1.04 if mean_val < 160.0 else 1.00), 2)
+    rec["shadow_lift"] = 0.08
+    rec["bg_pop"] = round(0.97 if (mean_sat > 145.0 and high_sat_ratio > 0.45) else 1.05, 2)
     rec["grain"] = False
     return effective_medium, rec
 
@@ -477,12 +427,12 @@ def apply_art_edit(
     bg_pop_factor: float,
     add_subtle_grain: bool,
 ) -> Image.Image:
-    """Apply balanced brightness, saturation/vibrance (both up and down), contrast, and detail."""
+    """Apply balanced brightness, saturation/vibrance, contrast, and detail."""
     rgb = np.array(pil_img.convert("RGB")).astype(np.float32) / 255.0
 
     if abs(shadow_lift) > 0.001:
         shadow_mask = np.power(np.clip(1.0 - rgb, 0.0, 1.0), 2.0)
-        rgb = np.clip(rgb + shadow_lift * 0.28 * shadow_mask, 0.0, 1.0)
+        rgb = np.clip(rgb + shadow_lift * 0.25 * shadow_mask, 0.0, 1.0)
 
     if abs(warmth_shift) > 0.001:
         shift = warmth_shift * 0.05
@@ -503,7 +453,6 @@ def apply_art_edit(
     skin_like = (h >= 2.0) & (h <= 24.0) & (s >= 18.0) & (s <= 155.0) & (v >= 95.0)
     bg_mask = ~skin_like
 
-    # Vibrance: boosts muted pixels more when > 1.0, or gently pulls down excess saturation when < 1.0
     if vibrance_factor > 1.0:
         sat_norm = np.clip(s / 255.0, 0.0, 1.0)
         vib_gain = (1.0 - sat_norm * 0.75) * (vibrance_factor - 1.0)
@@ -511,18 +460,17 @@ def apply_art_edit(
     elif vibrance_factor < 1.0:
         s = np.clip(s * vibrance_factor, 0.0, 255.0)
 
-    # Saturation multiplier: scales up if > 1.0 (on lower-sat images) or scales down smoothly if < 1.0
-    if sat_boost_max > 1.0 and mean_sat < 115.0:
-        deficit = max(0.0, (115.0 - mean_sat) / 115.0)
+    if sat_boost_max > 1.0 and mean_sat < 130.0:
+        deficit = max(0.15, (130.0 - mean_sat) / 130.0)
         scale = 1.0 + deficit * (sat_boost_max - 1.0)
-        s[skin_like] = np.clip(s[skin_like] * (1.0 + (scale - 1.0) * 0.55), 0.0, 255.0)
+        s[skin_like] = np.clip(s[skin_like] * (1.0 + (scale - 1.0) * 0.60), 0.0, 255.0)
         s[bg_mask] = np.clip(s[bg_mask] * scale, 0.0, 255.0)
     elif sat_boost_max < 1.0:
         s = np.clip(s * sat_boost_max, 0.0, 255.0)
 
     if abs(bg_pop_factor - 1.0) > 0.001:
         s[bg_mask] = np.clip(s[bg_mask] * bg_pop_factor, 0.0, 255.0)
-        v[bg_mask] = np.clip(v[bg_mask] * (1.0 + (bg_pop_factor - 1.0) * 0.35), 0.0, 255.0)
+        v[bg_mask] = np.clip(v[bg_mask] * (1.0 + (bg_pop_factor - 1.0) * 0.25), 0.0, 255.0)
 
     rgb_f = cv2.cvtColor(cv2.merge([h, s, v]).astype(np.uint8), cv2.COLOR_HSV2RGB).astype(np.float32)
 
@@ -706,7 +654,6 @@ with tab_editor:
         st.info("Upload images, PDFs, or a ZIP archive above—or switch to **Local Folder (`input/`)**.")
         st.stop()
 
-    # Only show Start/End range controls when there are multiple items (e.g., ZIP, PDF, or multiple files)
     if total_found > 1:
         st.info(f"**Total items detected:** {total_found} image(s)/page(s).")
         rng_c1, rng_c2, rng_c3 = st.columns([1.2, 1.2, 2.6])
