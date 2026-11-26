@@ -1,0 +1,21 @@
+@'
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+app.py.bak
+cache/*.png
+input/*
+output/*
+!input/.gitkeep
+!output/.gitkeep
+!cache/.gitkeep
+'@ | Set-Content -Path .gitignore -Encoding utf8
+
+@'
+streamlit
+opencv-python-headless
+numpy
+Pillow
+pymupdf
+'@ | Set-Content -Path requirements.txt -Encoding utf8
