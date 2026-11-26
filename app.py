@@ -60,6 +60,27 @@ def pdf_bytes_to_pages(pdf_bytes: bytes, source_label: str, dpi: int = 250) -> l
     return pages
 
 
+def extract_zip_items(zip_bytes: bytes, zip_label: str, pdf_dpi: int = 250) -> list[tuple[str, Image.Image]]:
+    """Extract images and PDFs from a zip archive (skipping hidden/macOS metadata files)."""
+    extracted: list[tuple[str, Image.Image]] = []
+    with zipfile.ZipFile(BytesIO(zip_bytes), "r") as zf:
+        for info in sorted(zf.infolist(), key=lambda x: x.filename):
+            if info.is_dir():
+                continue
+            member_path = Path(info.filename)
+            if "__MACOSX" in member_path.parts or member_path.name.startswith("."):
+                continue
+            ext_lower = member_path.suffix.lower()
+            entry_label = f"{zip_label}/{info.filename}"
+            raw_member = zf.read(info.filename)
+            if ext_lower in SUPPORTED_IMAGE_EXTS:
+                with Image.open(BytesIO(raw_member)) as im:
+                    extracted.append((entry_label, im.convert("RGB")))
+            elif ext_lower == ".pdf":
+                extracted.extend(pdf_bytes_to_pages(raw_member, entry_label, dpi=pdf_dpi))
+    return extracted
+
+
 def orient_image(pil_img: Image.Image, rot_deg: int, flip_h: bool, flip_v: bool) -> Image.Image:
     """Apply clockwise rotation (0/90/180/270) and optional horizontal/vertical flip."""
     out = pil_img.copy()
@@ -84,6 +105,12 @@ def load_pdf_pages_cached(pdf_bytes: bytes, source_label: str, dpi: int) -> list
     return pdf_bytes_to_pages(pdf_bytes, source_label, dpi=dpi)
 
 
+@st.cache_data(show_spinner="Extracting ZIP archive...")
+def load_zip_items_cached(zip_bytes: bytes, zip_label: str, dpi: int) -> list[tuple[str, Image.Image]]:
+    """Cache items extracted from uploaded ZIP archives."""
+    return extract_zip_items(zip_bytes, zip_label, pdf_dpi=dpi)
+
+
 @st.cache_data(show_spinner="Loading input folder items...")
 def load_local_input_cached(input_dir_str: str, pdf_dpi: int) -> list[tuple[str, list[tuple[str, bytes]]]]:
     """Collect image paths and PDF raw bytes from input/ without re-decoding on every rerun."""
@@ -103,56 +130,113 @@ def load_local_input_cached(input_dir_str: str, pdf_dpi: int) -> list[tuple[str,
     return collected
 
 
-# 2. Backend Dynamic Analysis
+# 2. Backend Dynamic Analysis (supports both increasing and decreasing knobs)
 # ---------------------------------------------------------------------------
 def analyze_image(pil_img: Image.Image) -> dict[str, float | bool]:
-    """Inspect tone, saturation, shadows, and detail to recommend balanced settings."""
+    """Inspect tone, saturation, brightness, contrast, and detail to recommend balanced settings."""
     rgb = np.array(pil_img.convert("RGB")).astype(np.float32)
     hsv = cv2.cvtColor(rgb.astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
     gray = cv2.cvtColor(rgb.astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32)
 
     mean_sat = float(np.mean(hsv[:, :, 1]))
-    high_sat_ratio = float(np.mean(hsv[:, :, 1] > 65.0))
+    high_sat_ratio = float(np.mean(hsv[:, :, 1] > 110.0))
     mean_val = float(np.mean(hsv[:, :, 2]))
+    highlight_ratio = float(np.mean(gray > 225.0))
     dark_ratio = float(np.mean(gray < 55.0))
     contrast_std = float(np.std(gray))
     edge_sharpness = float(cv2.Laplacian(gray, cv2.CV_32F).var())
     texture_var = float(np.var(gray))
 
-    is_sketch = mean_sat < 28.0 and high_sat_ratio < 0.08
+    is_sketch = mean_sat < 28.0 and high_sat_ratio < 0.05
 
     if is_sketch:
-        rec_sat = 1.02
-        rec_vibrance = 1.03
-        rec_contrast = 1.14 if contrast_std < 55.0 else 1.08
-        rec_sharpness = 1.20 if edge_sharpness < 450.0 else 1.10
-        rec_gamma = 0.98 if mean_val < 165.0 else 1.00
-        rec_brightness = 1.08 if mean_val < 165.0 else 1.03
-        rec_warmth = 0.04
-        rec_shadow_lift = 0.16 if dark_ratio > 0.10 else 0.08
-        rec_clarity = 1.15
-        rec_bg_pop = 1.05
+        rec_sat = 1.00
+        rec_vibrance = 1.00
+        if contrast_std > 78.0:
+            rec_contrast = 0.94
+        elif contrast_std < 55.0:
+            rec_contrast = 1.12
+        else:
+            rec_contrast = 1.04
+
+        if edge_sharpness > 950.0:
+            rec_sharpness = 0.92
+            rec_clarity = 0.95
+        elif edge_sharpness < 450.0:
+            rec_sharpness = 1.16
+            rec_clarity = 1.12
+        else:
+            rec_sharpness = 1.05
+            rec_clarity = 1.05
+
+        if mean_val > 195.0 or highlight_ratio > 0.16:
+            rec_gamma = 1.03
+            rec_brightness = 0.97
+        elif mean_val < 165.0:
+            rec_gamma = 0.98
+            rec_brightness = 1.06
+        else:
+            rec_gamma = 1.00
+            rec_brightness = 1.01
+
+        rec_warmth = 0.02 if mean_val < 185.0 else -0.02
+        rec_shadow_lift = 0.14 if dark_ratio > 0.12 else 0.04
+        rec_bg_pop = 1.02
         rec_grain = False
     else:
-        if mean_sat < 65.0:
-            rec_sat = 1.20
-            rec_vibrance = 1.22
-        elif mean_sat < 105.0:
-            rec_sat = 1.12
-            rec_vibrance = 1.16
+        # Tone down saturation/vibrance when the scan/image is already vivid or saturated
+        if mean_sat > 125.0 or high_sat_ratio > 0.35:
+            rec_sat = 0.88
+            rec_vibrance = 0.90
+            rec_bg_pop = 0.92
+        elif mean_sat > 105.0:
+            rec_sat = 0.95
+            rec_vibrance = 0.96
+            rec_bg_pop = 0.97
+        elif mean_sat < 65.0:
+            rec_sat = 1.16
+            rec_vibrance = 1.18
+            rec_bg_pop = 1.12
         else:
-            rec_sat = 1.05
-            rec_vibrance = 1.10
+            rec_sat = 1.03
+            rec_vibrance = 1.05
+            rec_bg_pop = 1.05
 
-        rec_contrast = 1.12 if contrast_std < 50.0 else (1.05 if contrast_std > 75.0 else 1.09)
-        rec_sharpness = 1.15 if edge_sharpness < 350.0 else 1.08
-        rec_gamma = 0.94 if mean_val < 150.0 else 0.97
-        rec_brightness = 1.08 if mean_val < 140.0 else 1.04
-        rec_warmth = 0.05
-        rec_shadow_lift = 0.20 if dark_ratio > 0.08 else 0.10
-        rec_clarity = 1.12
-        rec_bg_pop = 1.18
-        rec_grain = texture_var < 1100.0
+        # Tone down contrast if already high-contrast; lift gently only if flat
+        if contrast_std > 75.0:
+            rec_contrast = 0.92
+        elif contrast_std < 48.0:
+            rec_contrast = 1.10
+        else:
+            rec_contrast = 1.02
+
+        # Avoid over-sharpening already crisp scans/digital renders
+        if edge_sharpness > 900.0:
+            rec_sharpness = 0.92
+            rec_clarity = 0.95
+        elif edge_sharpness < 350.0:
+            rec_sharpness = 1.12
+            rec_clarity = 1.08
+        else:
+            rec_sharpness = 1.03
+            rec_clarity = 1.03
+
+        # Protect bright/high-value images from looking blown out or overly bright
+        if mean_val > 180.0 or highlight_ratio > 0.14:
+            rec_gamma = 1.04
+            rec_brightness = 0.95
+            rec_shadow_lift = 0.04
+        elif mean_val < 145.0:
+            rec_gamma = 0.96
+            rec_brightness = 1.05
+            rec_shadow_lift = 0.16 if dark_ratio > 0.08 else 0.08
+        else:
+            rec_gamma = 1.00
+            rec_brightness = 0.99
+            rec_shadow_lift = 0.08 if dark_ratio > 0.10 else 0.05
+
+        rec_warmth = 0.02 if mean_val < 175.0 else -0.02
+        rec_grain = texture_var < 950.0 and mean_val < 190.0
 
     return {
         "sat": round(rec_sat, 2),
@@ -200,21 +284,63 @@ MEDIUM_PROFILES = [
 ]
 
 
+def enhance_pastel_backend(pil_img: Image.Image, base_rec: dict[str, float | bool]) -> dict[str, float | bool]:
+    """Refine dynamic recommendations for pastel artwork without over-saturating or over-brightening."""
+    rgb = np.array(pil_img.convert("RGB")).astype(np.float32)
+    hsv = cv2.cvtColor(rgb.astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
+    gray = cv2.cvtColor(rgb.astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32)
+
+    mean_sat = float(np.mean(hsv[:, :, 1]))
+    high_sat_ratio = float(np.mean(hsv[:, :, 1] > 110.0))
+    mean_val = float(np.mean(hsv[:, :, 2]))
+    highlight_ratio = float(np.mean(gray > 220.0))
+    contrast_std = float(np.std(gray))
+
+    rec = dict(base_rec)
+
+    if mean_sat > 120.0 or high_sat_ratio > 0.32:
+        rec["sat"] = round(min(float(rec["sat"]), 0.88), 2)
+        rec["vibrance"] = round(min(float(rec["vibrance"]), 0.90), 2)
+        rec["bg_pop"] = round(min(float(rec["bg_pop"]), 0.92), 2)
+    elif mean_sat < 68.0:
+        rec["sat"] = round(min(1.20, float(rec["sat"]) + 0.03), 2)
+        rec["vibrance"] = round(min(1.22, float(rec["vibrance"]) + 0.03), 2)
+        rec["bg_pop"] = round(min(1.15, float(rec["bg_pop"]) + 0.02), 2)
+    else:
+        rec["sat"] = round(min(float(rec["sat"]), 0.96), 2)
+        rec["vibrance"] = round(min(float(rec["vibrance"]), 0.98), 2)
+
+    if contrast_std > 72.0:
+        rec["contrast"] = round(min(float(rec["contrast"]), 0.93), 2)
+        rec["clarity"] = round(min(float(rec["clarity"]), 0.96), 2)
+    else:
+        rec["contrast"] = round(min(1.08, max(0.92, float(rec["contrast"]))), 2)
+        rec["clarity"] = round(min(1.08, max(0.95, float(rec["clarity"]))), 2)
+
+    if mean_val > 178.0 or highlight_ratio > 0.12:
+        rec["brightness"] = round(min(float(rec["brightness"]), 0.94), 2)
+        rec["gamma"] = round(max(float(rec["gamma"]), 1.04), 2)
+    elif mean_val < 145.0:
+        rec["brightness"] = round(min(1.08, float(rec["brightness"]) + 0.02), 2)
+
+    return rec
+
+
 def resolve_medium_and_base(pil_img: Image.Image, chosen_medium: str) -> tuple[str, dict[str, float | bool]]:
-    """Return effective medium name and tailored baseline knobs without altering Pastel defaults."""
+    """Return effective medium name and tailored baseline knobs (capable of both boost and reduction)."""
     base = analyze_image(pil_img)
     rgb = np.array(pil_img.convert("RGB")).astype(np.float32)
     hsv = cv2.cvtColor(rgb.astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
     gray = cv2.cvtColor(rgb.astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32)
 
     mean_sat = float(np.mean(hsv[:, :, 1]))
-    high_sat_ratio = float(np.mean(hsv[:, :, 1] > 65.0))
+    high_sat_ratio = float(np.mean(hsv[:, :, 1] > 110.0))
     mean_val = float(np.mean(hsv[:, :, 2]))
     contrast_std = float(np.std(gray))
     edge_sharpness = float(cv2.Laplacian(gray, cv2.CV_32F).var())
 
     if chosen_medium == "Auto-Detect":
-        effective_medium = "Pencil" if (mean_sat < 28.0 and high_sat_ratio < 0.08) else "Pastel"
+        effective_medium = "Pencil" if (mean_sat < 28.0 and high_sat_ratio < 0.05) else "Pastel"
     else:
         effective_medium = chosen_medium
 
@@ -226,40 +352,40 @@ def resolve_medium_and_base(pil_img: Image.Image, chosen_medium: str) -> tuple[s
         rec["sat"] = 1.00
         rec["vibrance"] = 1.00
         rec["bg_pop"] = 1.00
-        rec["warmth"] = 0.02 if mean_val > 195.0 else 0.0
-        rec["contrast"] = round(1.26 if contrast_std < 55.0 else 1.18, 2)
-        rec["sharpness"] = round(1.32 if edge_sharpness < 500.0 else 1.20, 2)
-        rec["clarity"] = round(1.24 if edge_sharpness < 500.0 else 1.14, 2)
-        rec["gamma"] = round(0.95 if mean_val < 165.0 else 0.98, 2)
-        rec["brightness"] = round(1.10 if mean_val < 170.0 else 1.04, 2)
-        rec["shadow_lift"] = round(0.22 if contrast_std < 50.0 else 0.14, 2)
+        rec["warmth"] = 0.01 if mean_val < 180.0 else -0.02
+        rec["contrast"] = round(0.93 if contrast_std > 75.0 else (1.16 if contrast_std < 52.0 else 1.05), 2)
+        rec["sharpness"] = round(0.92 if edge_sharpness > 900.0 else (1.20 if edge_sharpness < 450.0 else 1.06), 2)
+        rec["clarity"] = round(0.95 if edge_sharpness > 900.0 else (1.14 if edge_sharpness < 450.0 else 1.04), 2)
+        rec["gamma"] = round(1.04 if mean_val > 190.0 else (0.97 if mean_val < 160.0 else 1.00), 2)
+        rec["brightness"] = round(0.95 if mean_val > 190.0 else (1.06 if mean_val < 165.0 else 1.00), 2)
+        rec["shadow_lift"] = round(0.16 if (contrast_std < 50.0 and mean_val < 180.0) else 0.04, 2)
         rec["grain"] = False
         return effective_medium, rec
 
     if effective_medium == "Digital (Krita)":
         rec = dict(base)
-        rec["sat"] = round(min(1.08, float(base["sat"])), 2)
-        rec["vibrance"] = round(min(1.08, float(base["vibrance"])), 2)
-        rec["contrast"] = round(1.05 if contrast_std < 55.0 else 1.02, 2)
-        rec["sharpness"] = round(1.06 if edge_sharpness < 400.0 else 1.02, 2)
-        rec["clarity"] = 1.05
-        rec["gamma"] = 1.00
-        rec["brightness"] = 1.01
-        rec["shadow_lift"] = 0.04
-        rec["bg_pop"] = 1.05
+        rec["sat"] = round(0.90 if mean_sat > 120.0 else min(1.04, float(base["sat"])), 2)
+        rec["vibrance"] = round(0.92 if mean_sat > 120.0 else min(1.04, float(base["vibrance"])), 2)
+        rec["contrast"] = round(0.94 if contrast_std > 75.0 else (1.04 if contrast_std < 50.0 else 1.00), 2)
+        rec["sharpness"] = round(0.94 if edge_sharpness > 900.0 else (1.04 if edge_sharpness < 350.0 else 1.00), 2)
+        rec["clarity"] = round(0.96 if edge_sharpness > 900.0 else 1.02, 2)
+        rec["gamma"] = round(1.03 if mean_val > 185.0 else 1.00, 2)
+        rec["brightness"] = round(0.96 if mean_val > 185.0 else 1.00, 2)
+        rec["shadow_lift"] = 0.03
+        rec["bg_pop"] = round(0.95 if mean_sat > 120.0 else 1.02, 2)
         return effective_medium, rec
 
     # Sketch Pen / Marker
     rec = dict(base)
-    rec["sat"] = round(1.14 if mean_sat < 85.0 else 1.06, 2)
-    rec["vibrance"] = round(1.14 if mean_sat < 85.0 else 1.06, 2)
-    rec["contrast"] = round(1.22 if contrast_std < 60.0 else 1.14, 2)
-    rec["sharpness"] = round(1.28 if edge_sharpness < 550.0 else 1.16, 2)
-    rec["clarity"] = 1.20
-    rec["gamma"] = 0.96
-    rec["brightness"] = round(1.07 if mean_val < 165.0 else 1.02, 2)
-    rec["shadow_lift"] = 0.12
-    rec["bg_pop"] = 1.10
+    rec["sat"] = round(0.90 if mean_sat > 120.0 else (1.08 if mean_sat < 75.0 else 1.00), 2)
+    rec["vibrance"] = round(0.92 if mean_sat > 120.0 else (1.08 if mean_sat < 75.0 else 1.00), 2)
+    rec["contrast"] = round(0.93 if contrast_std > 75.0 else (1.14 if contrast_std < 55.0 else 1.04), 2)
+    rec["sharpness"] = round(0.93 if edge_sharpness > 900.0 else (1.16 if edge_sharpness < 500.0 else 1.05), 2)
+    rec["clarity"] = round(0.96 if edge_sharpness > 900.0 else 1.08, 2)
+    rec["gamma"] = round(1.03 if mean_val > 185.0 else 0.98, 2)
+    rec["brightness"] = round(0.96 if mean_val > 185.0 else (1.04 if mean_val < 160.0 else 1.00), 2)
+    rec["shadow_lift"] = 0.06
+    rec["bg_pop"] = round(0.94 if mean_sat > 120.0 else 1.04, 2)
     rec["grain"] = False
     return effective_medium, rec
 
@@ -306,7 +432,6 @@ def auto_trim_border(pil_img: Image.Image, pad_px: int = 8) -> Image.Image:
     """Trim uniform bright/scan margins around artwork while keeping a small margin."""
     arr = np.array(pil_img.convert("RGB"))
     gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-    # Detect non-near-white pixels (threshold < 242)
     mask = gray < 242
     ys, xs = np.where(mask)
     if len(xs) == 0 or len(ys) == 0:
@@ -336,41 +461,6 @@ def apply_vignette(pil_img: Image.Image, strength: float) -> Image.Image:
     return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
 
 
-def enhance_pastel_backend(pil_img: Image.Image, base_rec: dict[str, float | bool]) -> dict[str, float | bool]:
-    """Refine dynamic backend recommendations specifically for pastel artwork."""
-    rgb = np.array(pil_img.convert("RGB")).astype(np.float32)
-    hsv = cv2.cvtColor(rgb.astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
-    gray = cv2.cvtColor(rgb.astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32)
-
-    mean_sat = float(np.mean(hsv[:, :, 1]))
-    mean_val = float(np.mean(hsv[:, :, 2]))
-    highlight_ratio = float(np.mean(gray > 225.0))
-    contrast_std = float(np.std(gray))
-
-    rec = dict(base_rec)
-    # Lift soft pastel colors cleanly while keeping high-saturation areas natural
-    if mean_sat < 70.0:
-        rec["sat"] = round(min(1.32, float(rec["sat"]) + 0.06), 2)
-        rec["vibrance"] = round(min(1.34, float(rec["vibrance"]) + 0.06), 2)
-    else:
-        rec["sat"] = round(min(1.22, float(rec["sat"]) + 0.03), 2)
-        rec["vibrance"] = round(min(1.26, float(rec["vibrance"]) + 0.04), 2)
-
-    # Gentle midtone contrast and clarity for pastel tooth/texture
-    rec["contrast"] = round(1.14 if contrast_std < 55.0 else 1.09, 2)
-    rec["clarity"] = round(1.16 if contrast_std < 65.0 else 1.10, 2)
-    rec["bg_pop"] = round(min(1.26, float(rec["bg_pop"]) + 0.04), 2)
-
-    # Protect blown highlights on bright pastel scans
-    if highlight_ratio > 0.12:
-        rec["brightness"] = round(max(0.98, float(rec["brightness"]) - 0.03), 2)
-        rec["gamma"] = round(min(1.03, float(rec["gamma"]) + 0.02), 2)
-    elif mean_val < 155.0:
-        rec["brightness"] = round(min(1.14, float(rec["brightness"]) + 0.03), 2)
-
-    return rec
-
-
 # 3. Backend Editing Pipeline
 # ---------------------------------------------------------------------------
 def apply_art_edit(
@@ -387,10 +477,10 @@ def apply_art_edit(
     bg_pop_factor: float,
     add_subtle_grain: bool,
 ) -> Image.Image:
-    """Apply natural brightness, skin-friendly warm tones, background pop, and detail."""
+    """Apply balanced brightness, saturation/vibrance (both up and down), contrast, and detail."""
     rgb = np.array(pil_img.convert("RGB")).astype(np.float32) / 255.0
 
-    if shadow_lift > 0.001:
+    if abs(shadow_lift) > 0.001:
         shadow_mask = np.power(np.clip(1.0 - rgb, 0.0, 1.0), 2.0)
         rgb = np.clip(rgb + shadow_lift * 0.28 * shadow_mask, 0.0, 1.0)
 
@@ -413,16 +503,22 @@ def apply_art_edit(
     skin_like = (h >= 2.0) & (h <= 24.0) & (s >= 18.0) & (s <= 155.0) & (v >= 95.0)
     bg_mask = ~skin_like
 
+    # Vibrance: boosts muted pixels more when > 1.0, or gently pulls down excess saturation when < 1.0
     if vibrance_factor > 1.0:
         sat_norm = np.clip(s / 255.0, 0.0, 1.0)
         vib_gain = (1.0 - sat_norm * 0.75) * (vibrance_factor - 1.0)
         s = np.clip(s * (1.0 + vib_gain), 0.0, 255.0)
+    elif vibrance_factor < 1.0:
+        s = np.clip(s * vibrance_factor, 0.0, 255.0)
 
-    if mean_sat < 115.0 and sat_boost_max > 1.0:
+    # Saturation multiplier: scales up if > 1.0 (on lower-sat images) or scales down smoothly if < 1.0
+    if sat_boost_max > 1.0 and mean_sat < 115.0:
         deficit = max(0.0, (115.0 - mean_sat) / 115.0)
         scale = 1.0 + deficit * (sat_boost_max - 1.0)
         s[skin_like] = np.clip(s[skin_like] * (1.0 + (scale - 1.0) * 0.55), 0.0, 255.0)
         s[bg_mask] = np.clip(s[bg_mask] * scale, 0.0, 255.0)
+    elif sat_boost_max < 1.0:
+        s = np.clip(s * sat_boost_max, 0.0, 255.0)
 
     if abs(bg_pop_factor - 1.0) > 0.001:
         s[bg_mask] = np.clip(s[bg_mask] * bg_pop_factor, 0.0, 255.0)
@@ -435,9 +531,9 @@ def apply_art_edit(
         rgb_f = np.clip(rgb_f + (rgb_f - blurred) * ((clarity_factor - 1.0) * 0.65), 0.0, 255.0)
 
     out_pil = Image.fromarray(np.clip(rgb_f, 0, 255).astype(np.uint8))
-    out_pil = ImageEnhance.Brightness(out_pil).enhance(brightness_factor)
-    out_pil = ImageEnhance.Contrast(out_pil).enhance(contrast_factor)
-    out_pil = ImageEnhance.Sharpness(out_pil).enhance(sharpness_factor)
+    out_pil = ImageEnhance.Brightness(out_pil).enhance(max(0.3, brightness_factor))
+    out_pil = ImageEnhance.Contrast(out_pil).enhance(max(0.3, contrast_factor))
+    out_pil = ImageEnhance.Sharpness(out_pil).enhance(max(0.0, sharpness_factor))
 
     if add_subtle_grain:
         arr = np.array(out_pil, dtype=np.float32)
@@ -490,13 +586,14 @@ def build_default_stem(label: str, index_1based: int, rename_mode: str, prefix: 
 # ---------------------------------------------------------------------------
 st.set_page_config(page_title="Art Studio", layout="wide")
 st.title("Art Studio")
-st.caption("Edit images or multi-page PDFs, fix page orientation, select a range for large batches, and track live progress.")
+st.caption("Edit images, PDFs, or ZIP archives, fix page orientation, select a range for batches, and track live progress.")
 
 with st.sidebar:
     st.header("1. Source")
     source_mode = st.radio(
         "Input source",
-        ["Local Folder (`input/`)", "Upload Files (Browser / Cloud)"],
+        ["Upload Files (Browser / Cloud)", "Local Folder (`input/`)"],
+        index=0,
     )
 
     st.header("2. Medium & Main Knobs")
@@ -512,17 +609,17 @@ with st.sidebar:
     is_fine_tune = knob_mode.startswith("Fine-Tune")
 
     if is_fine_tune:
-        st.caption("1.00 = keep each image's automatic backend recommendation.")
-        sat_slider = st.slider("Saturation Boost", 0.70, 1.35, 1.00, 0.02)
-        contrast_slider = st.slider("Contrast", 0.75, 1.35, 1.00, 0.02)
-        sharpness_slider = st.slider("Sharpness", 0.75, 1.35, 1.00, 0.02)
+        st.caption("1.00 = keep each image's automatic backend recommendation (< 1.00 reduces, > 1.00 boosts).")
+        sat_slider = st.slider("Saturation Boost", 0.60, 1.35, 1.00, 0.02)
+        contrast_slider = st.slider("Contrast", 0.65, 1.35, 1.00, 0.02)
+        sharpness_slider = st.slider("Sharpness", 0.65, 1.35, 1.00, 0.02)
         gamma_slider = st.slider("Gamma", 0.75, 1.25, 1.00, 0.02)
     else:
         st.caption("Applies these exact values to every image.")
-        sat_slider = st.slider("Saturation Boost", 1.00, 1.60, 1.12, 0.02)
-        contrast_slider = st.slider("Contrast", 0.80, 1.50, 1.09, 0.02)
-        sharpness_slider = st.slider("Sharpness", 0.75, 1.75, 1.15, 0.02)
-        gamma_slider = st.slider("Gamma", 0.75, 1.30, 0.96, 0.02)
+        sat_slider = st.slider("Saturation Boost", 0.60, 1.60, 1.00, 0.02)
+        contrast_slider = st.slider("Contrast", 0.65, 1.50, 1.00, 0.02)
+        sharpness_slider = st.slider("Sharpness", 0.65, 1.75, 1.02, 0.02)
+        gamma_slider = st.slider("Gamma", 0.75, 1.30, 1.00, 0.02)
 
     st.header("3. Layout")
     preview_height = st.slider("Preview Height (px)", 160, 720, DEFAULT_PREVIEW_HEIGHT, 20)
@@ -582,13 +679,14 @@ with tab_editor:
         for kind, payload in raw_entries:
             label, data_bytes = payload[0]
             if kind == "img":
-                loaded_items.append((label, Image.open(BytesIO(data_bytes)).convert("RGB")))
+                with Image.open(BytesIO(data_bytes)) as im:
+                    loaded_items.append((label, im.convert("RGB")))
             elif kind == "pdf":
                 loaded_items.extend(load_pdf_pages_cached(data_bytes, label, int(pdf_dpi)))
     else:
         uploads = st.file_uploader(
-            "Upload artwork images or multi-page PDF scans",
-            type=["png", "jpg", "jpeg", "webp", "pdf"],
+            "Upload artwork images, multi-page PDF scans, or ZIP archives",
+            type=["png", "jpg", "jpeg", "webp", "pdf", "zip"],
             accept_multiple_files=True,
         )
         if uploads:
@@ -597,60 +695,73 @@ with tab_editor:
                 raw_bytes = uf.getvalue()
                 if ext_lower == ".pdf":
                     loaded_items.extend(load_pdf_pages_cached(raw_bytes, uf.name, int(pdf_dpi)))
+                elif ext_lower == ".zip":
+                    loaded_items.extend(load_zip_items_cached(raw_bytes, uf.name, int(pdf_dpi)))
                 else:
-                    loaded_items.append((uf.name, Image.open(BytesIO(raw_bytes)).convert("RGB")))
+                    with Image.open(BytesIO(raw_bytes)) as im:
+                        loaded_items.append((uf.name, im.convert("RGB")))
 
     total_found = len(loaded_items)
     if total_found == 0:
-        st.info("Place images or PDFs in `input/` (including any subfolders), or switch to **Upload Files**.")
+        st.info("Upload images, PDFs, or a ZIP archive above—or switch to **Local Folder (`input/`)**.")
         st.stop()
 
-    st.info(f"**Total items detected:** {total_found} image(s)/page(s).")
-    rng_c1, rng_c2, rng_c3 = st.columns([1.2, 1.2, 2.6])
-    with rng_c1:
-        start_idx = int(st.number_input("Start from #", min_value=1, max_value=total_found, value=1, step=1))
-    with rng_c2:
-        default_end = min(total_found, 5)
-        end_idx = int(st.number_input("End at #", min_value=start_idx, max_value=total_found, value=default_end, step=1))
-    with rng_c3:
-        st.write("")
-        run_clicked = st.button("Process Selected Range", type="primary")
+    # Only show Start/End range controls when there are multiple items (e.g., ZIP, PDF, or multiple files)
+    if total_found > 1:
+        st.info(f"**Total items detected:** {total_found} image(s)/page(s).")
+        rng_c1, rng_c2, rng_c3 = st.columns([1.2, 1.2, 2.6])
+        with rng_c1:
+            start_idx = int(st.number_input("Start from #", min_value=1, max_value=total_found, value=1, step=1))
+        with rng_c2:
+            default_end = min(total_found, 5)
+            end_idx = int(st.number_input("End at #", min_value=start_idx, max_value=total_found, value=default_end, step=1))
+        with rng_c3:
+            st.write("")
+            run_clicked = st.button("Process Selected Range", type="primary")
 
-    if "active_range" not in st.session_state:
-        st.session_state["active_range"] = None
+        if "active_range" not in st.session_state:
+            st.session_state["active_range"] = None
 
-    if run_clicked:
-        st.session_state["active_range"] = (start_idx, end_idx)
+        if run_clicked:
+            st.session_state["active_range"] = (start_idx, end_idx)
 
-    active_range = st.session_state["active_range"]
-    if active_range is None:
-        st.caption(f"Set **Start from #** and **End at #** (1 to {total_found}), then click **Process Selected Range**.")
-        st.stop()
+        active_range = st.session_state["active_range"]
+        if active_range is None:
+            st.caption(f"Set **Start from #** and **End at #** (1 to {total_found}), then click **Process Selected Range**.")
+            st.stop()
 
-    run_start, run_end = active_range
-    run_start = max(1, min(run_start, total_found))
-    run_end = max(run_start, min(run_end, total_found))
+        run_start, run_end = active_range
+        run_start = max(1, min(run_start, total_found))
+        run_end = max(run_start, min(run_end, total_found))
+    else:
+        start_idx = 1
+        end_idx = 1
+        run_start = 1
+        run_end = 1
+
     selected_items = loaded_items[run_start - 1 : run_end]
 
     with st.expander("More Settings, Extra Sliders & Dynamic Backend Table", expanded=False):
         st.markdown("#### Extra Optional Sliders")
         ex_c1, ex_c2, ex_c3 = st.columns(3)
         with ex_c1:
-            brightness_extra = st.slider("Brightness Lift", 0.80, 1.30, 1.00, 0.02)
+            brightness_extra = st.slider("Brightness Lift", 0.75, 1.30, 1.00, 0.02)
             warmth_extra = st.slider("Warmth Shift", -0.50, 0.50, 0.00, 0.02)
         with ex_c2:
-            vibrance_extra = st.slider("Vibrance Multiplier", 0.75, 1.35, 1.00, 0.02)
-            clarity_extra = st.slider("Clarity Multiplier", 0.75, 1.35, 1.00, 0.02)
+            vibrance_extra = st.slider("Vibrance Multiplier", 0.65, 1.35, 1.00, 0.02)
+            clarity_extra = st.slider("Clarity Multiplier", 0.70, 1.35, 1.00, 0.02)
         with ex_c3:
-            shadow_extra = st.slider("Shadow Lift Multiplier", 0.50, 1.60, 1.00, 0.05)
-            bg_pop_extra = st.slider("Background Pop Multiplier", 0.80, 1.40, 1.00, 0.02)
+            shadow_extra = st.slider("Shadow Lift Multiplier", 0.00, 1.60, 1.00, 0.05)
+            bg_pop_extra = st.slider("Background Pop Multiplier", 0.70, 1.40, 1.00, 0.02)
 
         tint_extra = st.slider("Color Tint Shift (- cool/green, + warm/magenta)", -0.50, 0.50, 0.00, 0.02)
 
         grain_choice = st.selectbox(
             "Subtle Texture (smooth scans)",
             ["Per-Image Auto", "Always On", "Always Off"],
-            index=0, key="grain_choice_select")
+            index=0,
+            key="grain_choice_select",
+        )
 
         f_c1, f_c2 = st.columns(2)
         with f_c1:
@@ -744,9 +855,6 @@ with tab_editor:
                         with sub_r:
                             st.image(proportional_preview(p_e, 180), caption="Live Edit")
 
-
-
-
         c_act1, c_act2 = st.columns(2)
         with c_act1:
             if st.button("Clear Disk & Session Cache", key="clear_all_cache_btn"):
@@ -766,7 +874,7 @@ with tab_editor:
             p_fh = bool(st.session_state.get(f"fh_{p_num}", False))
             p_fv = bool(st.session_state.get(f"fv_{p_num}", False))
             p_oriented = orient_image(raw_item_img, rot_deg=p_rot, flip_h=p_fh, flip_v=p_fv)
-            p_rec = analyze_image(p_oriented)
+            _, p_rec = resolve_medium_and_base(p_oriented, medium_preset if not medium_preset.startswith("Custom: ") else "Pastel")
             backend_rows.append(
                 {
                     "#": p_num,
@@ -990,6 +1098,11 @@ with tab_editor:
                     t_arr[:, :, 1] = np.clip(t_arr[:, :, 1] - t_delta * 0.8, 0, 255)
                     t_arr[:, :, 2] = np.clip(t_arr[:, :, 2] + t_delta * 0.6, 0, 255)
                     edited_img = Image.fromarray(t_arr.astype(np.uint8))
+                if trim_borders:
+                    oriented_orig = auto_trim_border(oriented_orig)
+                    edited_img = auto_trim_border(edited_img)
+                if vignette_strength > 0.001:
+                    edited_img = apply_vignette(edited_img, vignette_strength)
                 cache[cache_key] = (oriented_orig, edited_img)
 
             prepared_records.append(
@@ -1061,7 +1174,6 @@ with tab_editor:
             with cols[col_idx]:
                 st.markdown(f"**#{item_num} — {label}**")
 
-                # Orientation fix buttons (rotate 90° left/right, flip horizontal/vertical)
                 o1, o2, o3, o4 = st.columns(4)
                 with o1:
                     if st.button("↺ 90°", key=f"rotl_{item_num}", help="Rotate 90° counter-clockwise"):
@@ -1125,17 +1237,18 @@ with tab_editor:
 
         st.divider()
 
-    zip_buf = BytesIO()
-    with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for fname, data in zip_entries:
-            zf.writestr(fname, data)
+    if len(zip_entries) > 1:
+        zip_buf = BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for fname, data in zip_entries:
+                zf.writestr(fname, data)
 
-    st.download_button(
-        label=f"Download Selected {len(zip_entries)} Files (.zip)",
-        data=zip_buf.getvalue(),
-        file_name=f"edited_art_{start_idx}_to_{end_idx}_{output_format.lower()}.zip",
-        mime="application/zip",
-    )
+        st.download_button(
+            label=f"Download Selected {len(zip_entries)} Files (.zip)",
+            data=zip_buf.getvalue(),
+            file_name=f"edited_art_{start_idx}_to_{end_idx}_{output_format.lower()}.zip",
+            mime="application/zip",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1192,33 +1305,42 @@ with tab_scheduler:
         with up_c1:
             files_a = st.file_uploader(
                 "Group A (e.g., Pastel / Color artworks)",
-                type=["png", "jpg", "jpeg", "webp"],
+                type=["png", "jpg", "jpeg", "webp", "zip"],
                 accept_multiple_files=True,
                 key="sched_up_a",
             )
             if files_a:
                 for f in sorted(files_a, key=lambda x: x.name):
-                    group_a_items.append((f.name, Image.open(BytesIO(f.getvalue())).convert("RGB")))
+                    if Path(f.name).suffix.lower() == ".zip":
+                        group_a_items.extend(load_zip_items_cached(f.getvalue(), f.name, int(pdf_dpi)))
+                    else:
+                        with Image.open(BytesIO(f.getvalue())) as im:
+                            group_a_items.append((f.name, im.convert("RGB")))
         with up_c2:
             files_b = st.file_uploader(
                 "Group B (e.g., Pencil / Sketch artworks)",
-                type=["png", "jpg", "jpeg", "webp"],
+                type=["png", "jpg", "jpeg", "webp", "zip"],
                 accept_multiple_files=True,
                 key="sched_up_b",
             )
             if files_b:
                 for f in sorted(files_b, key=lambda x: x.name):
-                    group_b_items.append((f.name, Image.open(BytesIO(f.getvalue())).convert("RGB")))
+                    if Path(f.name).suffix.lower() == ".zip":
+                        group_b_items.extend(load_zip_items_cached(f.getvalue(), f.name, int(pdf_dpi)))
+                    else:
+                        with Image.open(BytesIO(f.getvalue())) as im:
+                            group_b_items.append((f.name, im.convert("RGB")))
     else:
         out_files = sorted(
             [p for p in OUTPUT_DIR.glob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_IMAGE_EXTS]
         )
         for p in out_files:
-            im = Image.open(BytesIO(p.read_bytes())).convert("RGB")
-            if is_low_sat_sketch(im):
-                group_b_items.append((p.name, im))
+            with Image.open(BytesIO(p.read_bytes())) as im:
+                rgb_im = im.convert("RGB")
+            if is_low_sat_sketch(rgb_im):
+                group_b_items.append((p.name, rgb_im))
             else:
-                group_a_items.append((p.name, im))
+                group_a_items.append((p.name, rgb_im))
         st.info(
             f"Detected in `output/`: **{len(group_a_items)}** Color/Pastel (Group A) and "
             f"**{len(group_b_items)}** Pencil/Sketch (Group B)."
@@ -1269,7 +1391,7 @@ with tab_scheduler:
         sched_prefix = st.text_input("Output filename prefix", value="post", key="sched_prefix_in")
 
     if not group_a_items and not group_b_items:
-        st.caption("Add images to Group A and/or Group B above to preview and export your scheduled sequence.")
+        st.caption("Add images or ZIP files to Group A and/or Group B above to preview and export your scheduled sequence.")
     elif take_a == 0 and take_b == 0:
         st.warning("Set at least one group count per cycle above 0.")
     else:
